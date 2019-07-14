@@ -5,6 +5,8 @@ use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 
 use lazy_static::lazy_static;
 
@@ -14,20 +16,49 @@ lazy_static! {
 }
 
 fn main() -> Result<(), io::Error> {
-    let stdout = io::stdout();
-    let stdout = stdout.lock();
-    let mut stdout = io::BufWriter::new(stdout);
-
     let suffix = env::args().nth(1).expect("usage: .suffix");
 
     let real_path = PathBuf::from(".");
 
-    process(&mut stdout, &suffix, &real_path)?;
+    let (mut send, recv) = mpsc::sync_channel(1_024);
+    let writing = thread::spawn(move || writer(recv).expect("worker failed"));
+
+    process(&mut send, &suffix, &real_path)?;
+
+    drop(send);
+    writing.join().expect("read/write failed");
 
     Ok(())
 }
 
-fn process<W: Write>(out: &mut W, suffix: &str, real_path: &Path) -> Result<(), io::Error> {
+fn writer(recv: mpsc::Receiver<PathBuf>) -> Result<(), io::Error> {
+    let stdout = io::stdout();
+    let stdout = stdout.lock();
+    let mut out = io::BufWriter::new(stdout);
+
+    let mut data = Vec::with_capacity(4_096);
+
+    while let Some(file_path) = recv.recv().ok() {
+        data.clear();
+
+        let printable_path = file_path.to_string_lossy();
+        out.write_all(printable_path.as_bytes())?;
+        out.write_all(b"\t")?;
+
+        io::BufReader::new(fs::File::open(file_path)?).read_to_end(&mut data)?;
+        let data = CRUSH_WHITESPACE.replace_all(&data, &b" "[..]);
+        out.write_all(&data)?;
+        out.write_all(b"\n")?;
+    }
+
+    Ok(())
+}
+
+fn process(
+    out: &mut mpsc::SyncSender<PathBuf>,
+    suffix: &str,
+    real_path: &Path,
+) -> Result<(), io::Error> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
 
@@ -52,16 +83,12 @@ fn process<W: Write>(out: &mut W, suffix: &str, real_path: &Path) -> Result<(), 
     files.sort();
 
     for file in files {
-        let mut data = Vec::with_capacity(4_096);
         let mut file_path = real_path.to_path_buf();
         file_path.push(file);
-        let printable_path = file_path.to_string_lossy();
-        out.write_all(printable_path.as_bytes())?;
-        out.write_all(b"\t")?;
-        io::BufReader::new(fs::File::open(file_path)?).read_to_end(&mut data)?;
-        let data = CRUSH_WHITESPACE.replace_all(&data, &b" "[..]);
-        out.write_all(&data)?;
-        out.write_all(b"\n")?;
+        match out.send(file_path) {
+            Ok(()) => (),
+            Err(_) => return Err(io::ErrorKind::BrokenPipe.into()),
+        }
     }
 
     for dir in dirs {
